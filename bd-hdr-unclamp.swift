@@ -24,7 +24,7 @@ import Foundation
 // MARK: - configuration
 
 let targetScreenName = "AW3425DW"          // matched by NSScreen.localizedName
-let pollSeconds: Double = 0.25     // always poll fast: entry and exit both feel instant
+let pollSeconds: Double = 1.0      // idle poll; 0.25 s once a candidate appears
 let graceSeconds: Double = 0.5        // before removing the look (just enough to skip flicker)
 let graceExitSeconds: Double = 0.25   // before restoring it
 let fastPollSeconds: Double = 0.5
@@ -37,6 +37,7 @@ let stateDir = ("~/.local/state/bd-hdr-unclamp" as NSString).expandingTildeInPat
 let configDir = ("~/.config/bd-hdr-unclamp" as NSString).expandingTildeInPath
 let pauseFile = configDir + "/pause"
 let stateFile = stateDir + "/state.json"
+let ignoreFile = configDir + "/ignore"
 let logFile = stateDir + "/bd-hdr-unclamp.log"
 let logCapBytes = 1_000_000
 
@@ -105,7 +106,14 @@ func targetDisplayID() -> CGDirectDisplayID? {
 }
 
 /// True when some normal app window covers the target display.
+func ignoredAppNames() -> Set<String> {
+    guard let txt = try? String(contentsOfFile: ignoreFile, encoding: .utf8) else { return [] }
+    return Set(txt.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+                  .filter { !$0.isEmpty && !$0.hasPrefix("#") })
+}
+
 func fullscreenOwner() -> String? {
+    let ignored = ignoredAppNames()
     guard let dispID = targetDisplayID() else { return nil }
     let bounds = CGDisplayBounds(dispID)
     let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
@@ -126,8 +134,9 @@ func fullscreenOwner() -> String? {
         // only real foreground apps: excludes WindowServer, Dock, loginwindow, screensaver
         guard let app = NSRunningApplication(processIdentifier: pid),
               app.activationPolicy == .regular else { continue }
-        // an app with no visible menu bar presence (accessory) is not "content"
-        return app.localizedName ?? "pid \(pid)"
+        let name = app.localizedName ?? "pid \(pid)"
+        if ignored.contains(name) { continue }
+        return name
     }
     return nil
 }
@@ -272,7 +281,32 @@ if once {
     log("single evaluation done, mode=\(state.mode)")
     exit(0)
 }
+var consecutiveFailures = 0
+var lastFailureLog = Date.distantPast
+var lastSeenOwner: Date = .distantPast
+
 while true {
+    let before = state.mode
     evaluate()
-    Thread.sleep(forTimeInterval: state.mode == "hdr" ? fastPollSeconds : pollSeconds)
+    let owner = fullscreenOwner()
+    if owner != nil { lastSeenOwner = Date() }
+    if state.mode != before { consecutiveFailures = 0 }
+
+    // BetterDisplay missing or not answering: back off instead of logging 4x/second
+    if bdGet("hdr") == nil {
+        consecutiveFailures += 1
+        if Date().timeIntervalSince(lastFailureLog) > 60 {
+            log("BetterDisplay not answering (failures=\(consecutiveFailures)) — backing off")
+            lastFailureLog = Date()
+        }
+        if consecutiveFailures > 3 {
+            Thread.sleep(forTimeInterval: 5.0)
+            continue
+        }
+    } else {
+        consecutiveFailures = 0
+    }
+
+    let active = state.mode == "hdr" || Date().timeIntervalSince(lastSeenOwner) < 5
+    Thread.sleep(forTimeInterval: active ? fastPollSeconds : pollSeconds)
 }

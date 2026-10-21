@@ -32,6 +32,29 @@ Which settings cause the clamp, isolated one at a time:
 
 So the fix is narrow: neutralise brightness/gamma/temperature, leave saturation alone.
 
+## BetterDisplay already documents this behaviour
+
+From BetterDisplay's own documentation:
+
+> the color table based XDR/HDR upscaling method (or color table based dimming) when
+> active, on-screen HDR content is clipped at max SDR brightness. Because of this, if you
+> are watching HDR content, you should set the display's brightness in a way that upscaling
+> (and dimming) does not take effect.
+
+Their recommended workaround is to set those controls to neutral while watching HDR; the
+default **"Reset colors on neutral settings for HDR capable screens"** option then releases
+the colour table so HDR is no longer clipped.
+
+**This tool does nothing cleverer than that.** It performs exactly that workaround
+automatically: it flips brightness/gamma/temperature to neutral when a fullscreen window
+appears on the target display, and puts your own saved values back when it goes away. It
+drives BetterDisplay through its CLI — it does not patch, bypass or reverse-engineer it.
+
+**Requires** that option to be enabled. With it off, neutral controls may leave the colour
+table installed and HDR still clipped.
+
+If BetterDisplay ever gains a fullscreen/HDR trigger of its own, use that instead.
+
 ## What it does
 
 - Detects a window that covers the target display, owned by a regular (foreground) app.
@@ -80,6 +103,15 @@ Edit the constants at the top of `bd-hdr-unclamp.swift`:
   peaks rather than ~465, select that mode on the monitor itself.
 - **Pausing the video keeps HDR active** — the window is still fullscreen. Leaving fullscreen
   is what restores the look.
+- **Windowed HDR is not detected.** YouTube HDR in a window, Picture-in-Picture, and Photos HDR
+  all keep the clamp. Only a window covering the whole display triggers the switch.
+- **Ignore list.** Put app names (one per line) in `~/.config/bd-hdr-unclamp/ignore` to stop a
+  particular app from triggering the switch.
+- **CPU/battery.** It polls every 1 s when idle and 0.25 s while a fullscreen candidate is
+  present; a window-list query is cheap, but it is not zero on battery.
+- **Claims are scoped.** The numbers above are one panel (AW3425DW), one OS build, one
+  BetterDisplay version. The clamp itself follows from how macOS applies transfer tables and
+  should be general, but the measured figures are not.
 - Tested on one machine, one display, one macOS build. Sleep/wake, dock reconnects and
   multi-display setups are handled by design (display resolved by name each poll, state
   reconciled on startup) but are not exhaustively tested.
