@@ -32,6 +32,7 @@ let onceMode = CommandLine.arguments.contains("--once")
 let effectiveGraceEnter: Double = onceMode ? 0.0 : graceSeconds
 let effectiveGraceExit: Double = onceMode ? 0.0 : graceExitSeconds
 let reassertSeconds: Double = 30.0
+let bdTimeoutSeconds: Double = 5.0     // a single betterdisplaycli call may never exceed this
 let bdPath = "/opt/homebrew/bin/betterdisplaycli"
 let stateDir = ("~/.local/state/bd-hdr-unclamp" as NSString).expandingTildeInPath
 let configDir = ("~/.config/bd-hdr-unclamp" as NSString).expandingTildeInPath
@@ -76,10 +77,33 @@ func bd(_ args: [String]) -> (code: Int32, out: String) {
     p.standardOutput = pipe
     p.standardError = pipe
     do { try p.run() } catch { return (-1, "spawn failed") }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+    // Read with a deadline. betterdisplaycli has been observed to hang for MINUTES on this
+    // machine (the log's "not answering" episodes); a blocking readDataToEndOfFile would wedge
+    // the whole poll loop and leave the display neutralised until someone poked it.
+    let box = Box()
+    let group = DispatchGroup()
+    group.enter()
+    DispatchQueue.global(qos: .utility).async {
+        box.data = pipe.fileHandleForReading.readDataToEndOfFile()
+        group.leave()
+    }
+    if group.wait(timeout: .now() + bdTimeoutSeconds) == .timedOut {
+        p.terminate()                                   // SIGTERM
+        if group.wait(timeout: .now() + 1.0) == .timedOut {
+            kill(p.processIdentifier, SIGKILL)          // still stuck: reap it
+            _ = group.wait(timeout: .now() + 1.0)
+        }
+        log("betterdisplaycli \(args.first ?? "") timed out after \(Int(bdTimeoutSeconds))s — killed")
+        try? pipe.fileHandleForReading.close()
+        return (-2, "timeout")
+    }
     p.waitUntilExit()
-    return (p.terminationStatus, String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+    return (p.terminationStatus, String(data: box.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
 }
+
+final class Box: @unchecked Sendable { var data = Data() }
+
 
 func bdGet(_ feature: String) -> String? {
     let r = bd(["get", "-\(feature)"])
@@ -144,12 +168,22 @@ func fullscreenOwner() -> String? {
 // MARK: - persisted state
 
 struct Saved: Codable { var brightness: String; var gamma: String; var temperature: String }
-struct State: Codable { var mode: String; var saved: Saved? }
+/// `saved` is the snapshot taken when entering HDR mode; `tuned` is the last known good look and
+/// survives the round trip, so a capture taken while the display was ALREADY neutralised can never
+/// overwrite the owner's real values with 1.0/0/0.
+struct State: Codable { var mode: String; var saved: Saved?; var tuned: Saved? }
+
+let fallbackTuned = Saved(brightness: "1.15", gamma: "-0.34", temperature: "-0.03")
+
+func isNeutral(_ s: Saved) -> Bool {
+    func num(_ v: String) -> Double { Double(v.trimmingCharacters(in: .whitespaces)) ?? .nan }
+    return abs(num(s.brightness) - 1.0) < 0.001 && abs(num(s.gamma)) < 0.001 && abs(num(s.temperature)) < 0.001
+}
 
 func loadState() -> State {
     guard let d = FileManager.default.contents(atPath: stateFile),
           let s = try? JSONDecoder().decode(State.self, from: d) else {
-        return State(mode: "tuned", saved: nil)
+        return State(mode: "tuned", saved: nil, tuned: nil)
     }
     return s
 }
@@ -170,19 +204,29 @@ func captureAndNeutralise(dryRun: Bool) -> Saved? {
         log("cannot read current values — leaving display alone this tick")
         return nil
     }
-    let saved = Saved(brightness: b, gamma: g, temperature: t)
+    var captured = Saved(brightness: b, gamma: g, temperature: t)
+    if isNeutral(captured) {
+        // The panel was ALREADY neutral when this transition fired (an earlier run was killed
+        // mid-HDR, or a manual experiment left 1.0/0/0). Recording that as "the look" makes every
+        // later restore land on a washed-out display, so keep the last known good values.
+        captured = state.tuned ?? fallbackTuned
+        log("captured neutral values — keeping last tuned look (\(captured.brightness) / \(captured.gamma) / \(captured.temperature))")
+    }
+    let saved = captured
     if dryRun { log("[dry-run] would neutralise; saved \(saved)"); return saved }
     guard bdSet(neutral) else { log("bd set (neutralise) failed"); return nil }
-    log("HDR pass-through active (saved brightness=\(b) gamma=\(g) temperature=\(t))")
+    log("HDR pass-through active (saved brightness=\(saved.brightness) gamma=\(saved.gamma) temperature=\(saved.temperature))")
     return saved
 }
 
-func restore(_ saved: Saved?, dryRun: Bool) {
-    let s = saved ?? Saved(brightness: "1.15", gamma: "-0.34", temperature: "-0.03")
-    if dryRun { log("[dry-run] would restore \(s)"); return }
+@discardableResult
+func restore(_ saved: Saved?, dryRun: Bool) -> Saved {
+    let s = saved ?? state.tuned ?? fallbackTuned
+    if dryRun { log("[dry-run] would restore \(s)"); return s }
     let ok = bdSet([("brightness", s.brightness), ("gamma", s.gamma), ("temperature", s.temperature)])
     log(ok ? "tuned look restored (\(s.brightness) / \(s.gamma) / \(s.temperature))"
            : "RESTORE FAILED — check BetterDisplay")
+    return s
 }
 
 func displayIsHDR() -> Bool {
@@ -218,8 +262,8 @@ var state = loadState()
 if state.mode == "hdr" {
     if fullscreenOwner() == nil {
         log("startup: found state=hdr with nothing fullscreen — restoring")
-        restore(state.saved, dryRun: dryRun)
-        state = State(mode: "tuned", saved: nil); saveState(state)
+        let s = restore(state.saved, dryRun: dryRun)
+        state = State(mode: "tuned", saved: nil, tuned: s); saveState(state)
     } else {
         log("startup: resuming in hdr state (content still fullscreen)")
     }
@@ -248,15 +292,15 @@ func evaluate() {
         if pendingSince == nil { pendingSince = Date() }
         if let since = pendingSince, Date().timeIntervalSince(since) >= effectiveGraceEnter {
             if let saved = captureAndNeutralise(dryRun: dryRun) {
-                state = State(mode: "hdr", saved: saved); saveState(state)
+                state = State(mode: "hdr", saved: saved, tuned: saved); saveState(state)
             }
             pendingSince = nil
         }
     case (false, "hdr"):
         if pendingSince == nil { pendingSince = Date() }
         if let since = pendingSince, Date().timeIntervalSince(since) >= effectiveGraceExit {
-            restore(state.saved, dryRun: dryRun)
-            state = State(mode: "tuned", saved: nil); saveState(state)
+            let s = restore(state.saved, dryRun: dryRun)
+            state = State(mode: "tuned", saved: nil, tuned: s); saveState(state)
             pendingSince = nil
         }
     default:
@@ -267,8 +311,8 @@ func evaluate() {
 // restore on exit so a stop never leaves the display neutralised
 func shutdown() {
     if state.mode == "hdr" {
-        restore(state.saved, dryRun: dryRun)
-        saveState(State(mode: "tuned", saved: nil))
+        let s = restore(state.saved, dryRun: dryRun)
+        saveState(State(mode: "tuned", saved: nil, tuned: s))
     }
     log("exiting cleanly")
 }
